@@ -1,0 +1,43 @@
+services:
+  db:
+    image: mysql:8.0
+    network_mode: host
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${DB_NAME}
+      MYSQL_USER: ${DB_USER}
+      MYSQL_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - db_data:/var/lib/mysql
+      - ./database/database_setup.sql:/docker-entrypoint-initdb.d/setup.sql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h localhost -u root -p$$MYSQL_ROOT_PASSWORD"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  app:
+    build: ./app
+    network_mode: host
+    environment:
+      DB_HOST: 127.0.0.1
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      APP_VERSION: v1
+    depends_on:
+      db:
+        condition: service_healthy
+
+  web:
+    build: ./web
+    network_mode: host
+    environment:
+      APP_HOST: 127.0.0.1
+      APP_PORT: "80"
+      WEB_PORT: "8080"
+    depends_on:
+      - app
+
+volumes:
+  db_data:
