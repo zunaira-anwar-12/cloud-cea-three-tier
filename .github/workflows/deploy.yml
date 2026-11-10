@@ -1,0 +1,46 @@
+name: CEA pipeline
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Build and test three-tier app
+    runs-on: ubuntu-latest
+    env:
+      DB_NAME: hello_world
+      DB_USER: cea_test
+      DB_PASSWORD: local-ci-db-password
+      MYSQL_ROOT_PASSWORD: local-ci-root-password
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Build and start test containers
+        run: docker compose up -d --build
+
+      - name: Verify app health and database read
+        run: |
+          set -euo pipefail
+
+          curl -fsS --max-time 10 --retry 10 --retry-connrefused \
+            http://127.0.0.1:80/api/health.php |
+            jq -e '.status == "ok"'
+
+          curl -fsS --max-time 10 --retry 10 --retry-connrefused \
+            http://127.0.0.1:8080/api/get_messages.php |
+            jq -e '.success == true and any(.messages[]; .message == "Hello from the database!")'
+
+      - name: Show container logs on failure
+        if: failure()
+        run: docker compose logs --tail=80
+
+      - name: Clean up test containers and database volume
+        if: always()
+        run: docker compose down -v
+
