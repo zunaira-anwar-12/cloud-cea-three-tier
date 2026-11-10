@@ -53,7 +53,6 @@ jobs:
             container_id="$(docker compose ps -q "$service")"
             image_id="$(docker inspect --format '{{.Image}}' "$container_id")"
             target="ghcr.io/zunaira-anwar-12/cea-${service}:${GITHUB_SHA}"
-
             docker tag "$image_id" "$target"
             docker push "$target"
           done
@@ -66,13 +65,22 @@ jobs:
         if: always()
         run: docker compose down -v
 
-  inspect-aws:
-    name: Verify AWS deployment access
+  deploy:
+    name: Roll out to AWS and verify live app
     needs: test
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    concurrency:
+      group: cea-aws-production
+      cancel-in-progress: false
     permissions:
       id-token: write
+    env:
+      AWS_PAGER: ""
+      APP_TARGET_GROUP: arn:aws:elasticloadbalancing:us-east-1:947930847498:targetgroup/cea-app-tg/b8a15d8448024955
+      WEB_TARGET_GROUP: arn:aws:elasticloadbalancing:us-east-1:947930847498:targetgroup/cea-web-tg/6d6b550f294af8cc
+      PUBLIC_URL: http://cea-public-alb-1821568991.us-east-1.elb.amazonaws.com
 
     steps:
       - name: Sign in to AWS using OIDC
@@ -81,12 +89,111 @@ jobs:
           role-to-assume: arn:aws:iam::947930847498:role/cea-github-deploy-role
           aws-region: us-east-1
 
-      - name: Check AWS identity and Auto Scaling groups
+      - name: Refresh app and web Auto Scaling groups
         run: |
           set -euo pipefail
 
-          aws sts get-caller-identity
-          aws autoscaling describe-auto-scaling-groups \
-            --auto-scaling-group-names cea-app-asg cea-web-asg \
-            --query 'AutoScalingGroups[].{Group:AutoScalingGroupName,Desired:DesiredCapacity,TemplateVersion:LaunchTemplate.Version}' \
-            --output table
+          rollout() {
+            local tier="$1" template="$2" target_group="$3"
+            local group="cea-${tier}-asg"
+            local current_version user_data template_data new_version
+            local desired_config refresh_id refresh status deadline instances
+
+            current_version="$(aws autoscaling describe-auto-scaling-groups \
+              --auto-scaling-group-names "$group" \
+              --query 'AutoScalingGroups[0].LaunchTemplate.Version' --output text)"
+
+            if [[ ! "$current_version" =~ ^[0-9]+$ ]]; then
+              echo "$group must use a numeric launch template version."
+              return 1
+            fi
+
+            user_data="$(aws ec2 describe-launch-template-versions \
+              --launch-template-id "$template" --versions "$current_version" \
+              --query 'LaunchTemplateVersions[0].LaunchTemplateData.UserData' \
+              --output text | base64 --decode)"
+
+            grep -q "^IMAGE=ghcr.io/zunaira-anwar-12/cea-${tier}:" <<< "$user_data"
+            user_data="$(sed -E \
+              "s|^IMAGE=.*$|IMAGE=ghcr.io/zunaira-anwar-12/cea-${tier}:${GITHUB_SHA}|" \
+              <<< "$user_data")"
+
+            if [[ "$tier" == app ]]; then
+              grep -q -- '-e APP_VERSION=' <<< "$user_data"
+              user_data="$(sed -E "s|-e APP_VERSION=[^ ]+|-e APP_VERSION=${GITHUB_SHA}|" \
+                <<< "$user_data")"
+            fi
+
+            template_data="$(jq -cn --arg data "$(printf '%s\n' "$user_data" | base64 -w0)" \
+              '{UserData: $data}')"
+
+            new_version="$(aws ec2 create-launch-template-version \
+              --launch-template-id "$template" --source-version "$current_version" \
+              --version-description "GitHub commit ${GITHUB_SHA}" \
+              --launch-template-data "$template_data" \
+              --query 'LaunchTemplateVersion.VersionNumber' --output text)"
+
+            desired_config="$(jq -cn --arg id "$template" --arg version "$new_version" \
+              '{LaunchTemplate:{LaunchTemplateId:$id,Version:$version}}')"
+
+            refresh_id="$(aws autoscaling start-instance-refresh \
+              --auto-scaling-group-name "$group" \
+              --desired-configuration "$desired_config" \
+              --preferences '{"MinHealthyPercentage":100,"MaxHealthyPercentage":200,"InstanceWarmup":60,"AutoRollback":true}' \
+              --query InstanceRefreshId --output text)"
+
+            echo "$group started refresh $refresh_id using template version $new_version"
+            deadline=$((SECONDS + 1080))
+
+            while true; do
+              refresh="$(aws autoscaling describe-instance-refreshes \
+                --auto-scaling-group-name "$group" \
+                --instance-refresh-ids "$refresh_id" --output json)"
+              status="$(jq -er '.InstanceRefreshes[0].Status' <<< "$refresh")"
+              jq -r '.InstanceRefreshes[0] | "\(.Status): \(.StatusReason // "")"' <<< "$refresh"
+
+              case "$status" in
+                Successful) break ;;
+                Pending|InProgress|Baking|RollbackInProgress|Cancelling) ;;
+                *) return 1 ;;
+              esac
+
+              if (( SECONDS >= deadline )); then
+                echo "$group refresh timed out. Check refresh $refresh_id in AWS."
+                return 1
+              fi
+
+              sleep 15
+            done
+
+            instances="$(aws autoscaling describe-auto-scaling-groups \
+              --auto-scaling-group-names "$group" --output json |
+              jq -er --arg version "$new_version" '
+                [.AutoScalingGroups[0].Instances[]
+                  | select(.LifecycleState == "InService")
+                  | select(.LaunchTemplate.Version == $version)
+                  | .InstanceId]
+                | select(length > 0) | .[]')"
+
+            while read -r instance_id; do
+              aws elbv2 wait target-in-service \
+                --target-group-arn "$target_group" \
+                --targets "Id=$instance_id"
+              echo "$group target $instance_id is healthy on version $new_version"
+            done <<< "$instances"
+          }
+
+          rollout app lt-0fa5def66103145ce "$APP_TARGET_GROUP"
+          rollout web lt-020f62ad80fdd2887 "$WEB_TARGET_GROUP"
+
+      - name: Verify live release and database read
+        run: |
+          set -euo pipefail
+
+          curl -fsS --max-time 15 "$PUBLIC_URL/api/health.php" |
+            jq -e --arg version "$GITHUB_SHA" '.status == "ok" and .version == $version'
+
+          curl -fsS --max-time 15 "$PUBLIC_URL/api/get_messages.php" |
+            jq -e '.success == true and (.messages | type == "array")'
+
+          echo "Verified live app commit $GITHUB_SHA through the public ALB"
