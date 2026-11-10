@@ -6,12 +6,14 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 jobs:
   test:
     name: Build, test, and publish three-tier app
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     env:
       DB_NAME: hello_world
       DB_USER: cea_test
@@ -63,3 +65,28 @@ jobs:
       - name: Clean up test containers and database volume
         if: always()
         run: docker compose down -v
+
+  inspect-aws:
+    name: Verify AWS deployment access
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Sign in to AWS using OIDC
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: arn:aws:iam::947930847498:role/cea-github-deploy-role
+          aws-region: us-east-1
+
+      - name: Check AWS identity and Auto Scaling groups
+        run: |
+          set -euo pipefail
+
+          aws sts get-caller-identity
+          aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names cea-app-asg cea-web-asg \
+            --query 'AutoScalingGroups[].{Group:AutoScalingGroupName,Desired:DesiredCapacity,TemplateVersion:LaunchTemplate.Version}' \
+            --output table
